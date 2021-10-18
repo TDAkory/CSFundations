@@ -2,14 +2,14 @@
 
 * [Initial page](README.md)
 
-## BigFundament
+## Big_Fundament
 
-* [Page 1](bigfundament/page-1.md)
+* [Page 1](big_fundament/page-1.md)
 
 ## Algorithem
 
 * [Page 2](algorithem/page-2.md)
 
-## DataStructure
+## Data_Structure
 
-* [Page 3](datastructure/page-3.md)
+* [Page 3](data_structure/page-3.md)
