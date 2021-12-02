@@ -3,6 +3,7 @@
 ## Read List
 
 - [如何用 Cache 在 C++ 程序中进行系统级优化（一）](https://toutiao.io/posts/60r22r/preview)
+- [如何用 Cache 在 C++ 程序中进行系统级优化（二）](https://toutiao.io/posts/1e33zc/preview)
 
 ## Cache Info
 
