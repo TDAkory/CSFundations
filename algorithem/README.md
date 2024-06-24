@@ -3,6 +3,7 @@
 ## Basic Algorithm
 
 - [收录用 C++ 实现的各种算法的集合](https://github.com/TheAlgorithms/C-Plus-Plus)
+- [leetcode master](https://github.com/youngyangyang04/leetcode-master)
 
 ## T-digest
 
