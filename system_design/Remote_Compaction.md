@@ -1,5 +1,11 @@
 # `Remote Compaction`调研
 
+## 为什么需要Compaction
+
+compaction在以LSM-Tree为架构的系统中是非常关键的模块，log append的方式带来了高吞吐的写，内存中的数据到达上限后不断刷盘，数据范围互相交叠的层越来越多，相同key的数据不断积累，引起读性能下降和空间膨胀。因此，compaction机制被引入，通过周期性的后台任务不断的回收旧版本数据和将多层合并为一层的方式来优化读性能和空间问题。
+
+compaction的主要作用是数据的gc和归并排序，是lsm-tree系统正常运转必须要做的操作，但是compaction任务运行期间会带来很大的资源开销，压缩/解压缩、数据拷贝和compare消耗大量cpu，读写数据引起disk I/O。compaction策略约束了lsm-tree的形状，决定哪些文件需要合并、任务的大小和触发的条件，不同的策略对读写放大、空间放大和临时空间的大小有不同的影响，一般系统会支持不同的策略并配有多个调整参数，可根据不同的应用场景选取更合适的方式。
+
 ## Ref
 
 * [深入探讨LSM Compaction机制](https://developer.aliyun.com/article/758369)
