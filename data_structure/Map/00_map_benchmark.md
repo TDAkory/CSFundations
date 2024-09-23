@@ -10,6 +10,7 @@
 **header-only**
 
 * Very efficient, significantly faster than your compiler's unordered map/set or Boost's
+* [For a full writeup explaining the design and benefits of the Parallel Hashmap](https://greg7mdp.github.io/parallel-hashmap/)
 
 ## [abseil flat_hash_map](https://abseil.io/docs/cpp/guides/container)
 
