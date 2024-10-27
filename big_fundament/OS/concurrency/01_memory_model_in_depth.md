@@ -50,8 +50,7 @@ X86属于strong memory model，这意味着在大多数情况下cpu会保证内�
 2. Stores are not reordered with other stores.
 3. Stores are not reordered with older loads.
 4. Loads may be reordered with older stores to different locations but not with older stores to the same location.
-5. In a multiprocessor system, memory ordering obeys causality (memory ordering
-respects transitive visibility).
+5. In a multiprocessor system, memory ordering obeys causality (memory ordering respects transitive visibility).
 6. In a multiprocessor system, stores to the same location have a total order.
 7. In a multiprocessor system, locked instructions have a total order.
 8. Loads and stores are not reordered with locked instructions. 

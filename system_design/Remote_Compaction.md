@@ -35,3 +35,6 @@ The key difference between the two strategies is that leveled compaction tends t
   * [[RocksDB剖析系列] Remote Compaction](https://segmentfault.com/a/1190000041289857)
 * [Rocksdb Compaction源码详解（二）：Compaction 完整实现过程 概览](https://blog.csdn.net/Z_Stand/article/details/107592966)
 * [Rockdb compaction](https://github.com/facebook/rocksdb/wiki/Compaction?spm=a2c6h.12873639.article-detail.9.6f5c3f0eVW0Dpi)
+* [Remote Compactions in RocksDB-Cloud](https://rockset.com/blog/remote-compactions-in-rocksdb-cloud/)
+
+* [CaaS-LSM: Compaction-as-a-Service for LSM-based Key-Value Stores in Storage Disaggregated Infrastructure](https://www.cs.purdue.edu/homes/csjgwang/pubs/SIGMOD24_CaaSLSM.pdf)
