@@ -59,15 +59,13 @@ private:
 #include <chrono>
 #include <thread>
 
-// 类名首字母大写，使用驼峰命名法
 class LeakyBucket {
  public:
-  // 构造函数，使用冒号初始化列表，明确参数名称
   LeakyBucket(double capacity, double rate) : capacity_(capacity), rate_(rate), water_(0.0) {
     last_leak_time_ = std::chrono::steady_clock::now();
   }
 
-  // 尝试向桶中添加水量，函数名使用小写加下划线的风格
+  // 尝试向桶中添加水量
   bool TryAddWater(double amount) {
     // 先漏水
     double leaked = CalculateLeak();
@@ -83,7 +81,6 @@ class LeakyBucket {
   }
 
  private:
-  // 成员变量以下划线结尾，私有成员变量使用下划线命名法
   double capacity_;
   double rate_;
   double water_;
@@ -113,14 +110,12 @@ class LeakyBucket {
 
 class FixedWindowRateLimiter {
  public:
-  // 构造函数，使用冒号初始化列表，明确参数名称
   FixedWindowRateLimiter(int max_requests, int window_seconds)
       : limit_(max_requests),
         window_size_(std::chrono::seconds(window_seconds)),
         count_(0),
         window_start_(std::chrono::system_clock::now()) {}
 
-  // 尝试请求，函数名使用小写加下划线的风格
   bool TryRequest() {
     CheckAndReset();
     if (count_ < limit_) {
@@ -132,7 +127,6 @@ class FixedWindowRateLimiter {
   }
 
  private:
-  // 成员变量以下划线结尾，私有成员变量使用下划线命名法
   int limit_;
   std::chrono::seconds window_size_;
   int count_;
@@ -228,10 +222,13 @@ private:
 
 ## 3rd party libraries
 
-- [Hystrix: Latency and Fault Tolerance for Distributed Systems](https://github.com/Netflix/Hystrix)
-- [Fault tolerance library designed for functional programming](https://github.com/resilience4j/resilience4j)
-- []()
+* [Hystrix: Latency and Fault Tolerance for Distributed Systems](https://github.com/Netflix/Hystrix)
+* [Fault tolerance library designed for functional programming](https://github.com/resilience4j/resilience4j)
+* []()
 
 ## Ref
 
-- [设计一个限流组件](https://www.cnblogs.com/myshowtime/p/16313623.html)
+* [设计一个限流组件](https://www.cnblogs.com/myshowtime/p/16313623.html)
+* [限流熔断那些事儿](https://www.infoq.cn/article/limit-fuse-those-things)
+* [美团技术团队 - 《高并发系统限流实战，已经为你排好坑了》](https://tech.meituan.com/2016/09/14/concurrency-limit.html)
+
