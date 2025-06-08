@@ -1,6 +1,6 @@
 # Chat system
 
-![chat system](https://raw.githubusercontent.com/TDAkory/ImageResources/master/img/CSFundatons/chat_system.png)
+![chat system](https://raw.githubusercontent.com/TDAkory/ImageResources/master/img/CSFundations/chat_system.png)
 
 ## 需求定义
 
