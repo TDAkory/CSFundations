@@ -95,6 +95,29 @@ while (true) {
 - 若文件不存在，检查 `/etc/cron.deny`，**文件内列出的用户**被禁止使用 cron；
 - 若两个文件都不存在，**仅 root 用户**有权限使用 cron。
 
+### 一些设计权衡
+
+1. Misfire (错过触发) 行为
+   
+    如果任务预定执行时，机器处于关机状态，会发生什么？标准的 crond 不会做任何事。它不会在系统重启后“补偿”执行错过的任务。因为它的设计模型非常简单：只关心“当前这一分钟”应该做什么。
+
+    为了解决这个问题，anacron 工具应运而生。它通常用于桌面或笔记本电脑，这些设备不会 24/7 运行。anacron 会记录任务的最后一次执行时间戳，并在系统启动时检查是否有任务错过了执行周期（如“天”、“周”），如果有，则立即执行它。
+    
+    现代 Linux 系统中，systemd Timers 提供了比 cron 和 anacron 更强大和灵活的功能，例如秒级精度、更丰富的依赖关系、更好的日志集成以及处理错过任务的策略（通过 Persistent=true）。
+
+2. 时区与夏令时（DST）
+    这是一个 cron 著名的“坑”。crond 使用其所在操作系统的系统时区来解释 crontab 中的时间。这在夏令时（DST）切换时会导致问题：
+   - 时钟向前拨快一小时（例如，从 02:00 变为 03:00）：如果你的任务恰好定在 02:30 执行，那么这一天它将不会被执行，因为 02:30 这个时间点“消失”了。
+   - 时钟向后拨慢一小时（例如，从 02:00 回到 01:00）：如果你的任务定在 01:30 执行，它可能会被执行两次。
+    这清晰地表明 cron 的设计并未考虑复杂的时钟行为，它只信任操作系统报告的“当前时间”。
+
+3. 权限与安全
+   - 用户隔离：每个用户的 crontab 任务默认以该用户的身份运行，保证了基本的权限隔离。
+   - cron.allow 与 cron.deny：管理员可以通过 /etc/cron.allow 和 /etc/cron.deny 文件来精确控制哪些用户可以使用 crontab 命令。
+     - 如果 cron.allow 存在，则只有列在其中的用户可以使用。
+     - 如果 cron.allow 不存在但 cron.deny 存在，则列在 cron.deny 中的用户不能使用。
+   - MTA 集成：MAILTO 功能依赖于一个正常工作的邮件传输代理（MTA），如 sendmail 或 postfix。如果系统没有配置 MTA，邮件通知将失败。
+
 ---
 
 ## K8s Scheduler：分布式容器化任务的工业级资源调度
@@ -239,10 +262,58 @@ Extension Points:
 
 ---
 
-## 四、通用Job Scheduler的设计思路（兼顾多场景、高可用、可扩展）
-基于Linux Cron Job的「轻量易用」和K8s Scheduler的「分布式高可用、资源感知」，提炼出一套「**分层架构+可插拔组件+通用任务模型**」的通用设计方案，适配单机/分布式、容器/非容器、定时/事件触发等多场景，弥补两者的局限性。
+## 通用Job Scheduler的设计思路（兼顾多场景、高可用、可扩展）
 
-### 1. 通用设计的核心目标
+### Job Scheduler 再解读
+
+简单来说，Job Scheduler（任务调度器）就是为代码或程序配置的“闹钟”。通过预先设定好规则，调度器会在指定的时间或条件下，自动执行这些任务。
+
+它的核心职责是回答两个问题：“何时执行？” 与 “在哪执行？”。根据对这两个问题的不同侧重，调度器可以分为两大类：
+
+- **时间触发调度 (Time-based Scheduling)**：更关心“何时执行”。这类调度器专注于根据预设的时间点（如每天凌晨 2 点）、时间间隔（如每 5 分钟）或日历规则来触发任务。Linux Cron 是其最经典的代表。
+- **资源调度 (Resource-based Scheduling)**：更关心“在哪执行”。这类调度器负责在资源池（如服务器集群）中，为任务（如一个容器或应用实例）寻找最合适的“家”。它需要综合考虑节点的 CPU、内存、存储、网络以及各种复杂的策略（如亲和性、污点），来做出最优决策。
+
+在深入设计之前，理解以下几个通用概念至关重要，它们是衡量任何一个调度系统成熟度的关键标尺：
+
+1. **一致性语义 (Consistency Semantics)**：调度系统对任务执行的承诺是什么？
+   - **At-least-once (至少一次)**：这是最常见和实用的模型。系统保证任务至少会被成功执行一次。在网络分区、节点故障等异常情况下，任务可能会被重复执行。因此，它强烈依赖任务自身的幂等性来保证最终结果的正确性。
+   - **Exactly-once (精确一次)**：最严格的模型，保证任务在任何情况下都不多不少，只被成功执行一次。这在技术上实现成本极高，通常需要分布式事务、状态快照和原子提交等复杂机制的配合。对于绝大多数业务场景，追求绝对的“精确一次”性价比很低。
+  
+2. **幂等性 (Idempotency)**：幂等性是指一个操作无论执行一次还是多次，其产生的影响和结果都是相同的。它是实现 At-least-once 语义的基石。
+    - 示例：一个“创建订单”的任务，如果简单地执行数据库 INSERT，重复执行就会创建多笔相同订单。但如果引入一个唯一的“订单请求 ID”，在执行 INSERT 前先检查该 ID 是否已存在，任务就变得幂等了。
+
+3. **重试与补偿 (Retry & Compensation)**
+   - **重试 (Retry)**：当任务执行失败时（如网络超时、依赖服务不可用），调度系统应具备自动重试的能力。简单的立即重试可能会加剧下游系统压力，因此通常会采用指数退避（Exponential Backoff）等策略，逐步拉长重试间隔。
+   - **补偿 (Compensation)**：当一个由多个步骤组成的业务流程失败时，仅仅重试失败的步骤可能不够。补偿是指执行一个“反向操作”，以撤销已经成功完成的步骤，使系统状态回滚。例如，订单创建成功但支付失败，补偿操作可能就是“取消订单”。
+
+### 需求分析
+
+从需求视角来看：一个现代调度器应该具备什么？
+
+- 触发类型 (Trigger Types)：
+  - Cron 表达式：兼容标准 Cron，提供灵活的周期性调度。
+  - 固定频率 (Fixed Rate/Delay)：例如，“每隔 5 分钟执行一次”。
+  - 日历与例外 (Calendar & Exclusions)：支持复杂的日历逻辑，如“每个月的最后一个工作日”，并能排除特定日期（如法定节假日）。
+  - 执行窗口 (Time Windows)：定义任务只能在某个时间窗口内运行（白名单），或者不能在某个窗口内运行（黑名单）。
+  - 一次性任务 (One-shot)：在未来的某个特定时间点执行一次。
+- 执行语义 (Execution Semantics)：
+  - 幂等性与去重：系统应提供机制来辅助实现幂等性，例如为每次触发生成唯一的 invocation_id，并提供分布式锁防止重复执行。
+  - 并发策略 (Concurrency Policy)：当一个任务的下一次触发时间到达，但上一次执行还未结束时，系统应如何处理？
+    - Forbid：禁止并发执行，跳过本次触发。
+    - Allow：允许并发执行，新老任务并行。
+    - Replace：用新任务替换掉正在运行的老任务。
+  - Misfire 策略：当任务因调度器宕机等原因错过触发点时，恢复后应如何处理？
+    - Skip：跳过所有错过的触发。
+    - FireOnceNow：立即补发一次。
+    - FireAllMissed：补发所有错过的触发。
+  - Catch-up / Backfill (补数据)：支持手动触发一个任务，并回溯执行过去某个时间段内的所有周期。
+- 多租户与配额 (Multi-tenancy & Quotas)：
+  - 公平性：当大量任务同时到期时，如何确保不同租户或不同优先级的任务能公平地获得执行机会？可以借鉴 DRF (Dominant Resource Fairness) 思想，平衡不同维度的资源分配。
+  - 优先级与抢占：高优先级的任务应该能优先被调度和执行，甚至在资源紧张时抢占低优先级任务。
+  - 速率限制与背压 (Rate Limiting & Backpressure)：当任务执行速度跟不上生产速度时，Worker 应能向上游（调度器或消息队列）反馈压力，减缓任务分发速度，防止系统雪崩。
+
+### 设计目标
+
 1.  通用性：支持多种任务类型、执行载体、触发方式，无需重构即可适配不同业务场景；
 2.  高可用：无单点故障，任务不丢失、不重复执行，支持故障转移和容灾；
 3.  高性能：支持十万级/百万级任务调度，调度延迟低（毫秒级），支持大规模任务分片；
@@ -250,47 +321,176 @@ Extension Points:
 5.  容错性：完善的重试、死信、告警机制，支持任务全生命周期管控；
 6.  可观测：完善的监控、日志、可视化面板，便于运维排查问题和性能优化。
 
-### 2. 核心架构：5层分层解耦架构
-采用「分层架构」将核心功能解耦，每层通过标准化接口交互，支持插件化扩展，避免紧耦合，提升系统的灵活性和可维护性，架构如下：
+### 架构分层
+
+核心功能解耦，每层通过标准化接口交互，支持插件化扩展，避免紧耦合，提升系统的灵活性和可维护性，架构如下：
+
 ```
 ┌─────────────────────────────────────────────────────────┐
+│ 第一层：接入层（任务接收、校验、标准化、多入口）        │ 【任务入口，解耦输入】
+├─────────────────────────────────────────────────────────┤
+│ 第二层：存储层（任务持久化、集群状态、调度结果）        │ 【数据一致性与持久化保障】
+├─────────────────────────────────────────────────────────┤
+│ 第三层：调度核心层（定时触发、资源调度、决策引擎）      │ 【核心：解决何时/在哪执行】
+├─────────────────────────────────────────────────────────┤
+│ 第四层：执行层（任务执行、执行器池、容错、结果回调）    │ 【任务落地执行与管控】
+├─────────────────────────────────────────────────────────┤
 │ 第五层：监控与运维层（可视化、告警、日志、运维API）     │ 【可观测性与运维支撑】
-├─────────────────────────────────────────────────────────┤
-│ 第四层：执行层（任务执行、执行器池、容错、结果回调）   │ 【任务落地执行与管控】
-├─────────────────────────────────────────────────────────┤
-│ 第三层：调度核心层（定时触发、资源调度、决策引擎）     │ 【核心：解决何时/在哪执行】
-├─────────────────────────────────────────────────────────┤
-│ 第二层：存储层（任务持久化、集群状态、调度结果）       │ 【数据一致性与持久化保障】
-└─────────────────────────────────────────────────────────┘
-│ 第一层：接入层（任务接收、校验、标准化、多入口）       │ 【任务入口，解耦输入】
 └─────────────────────────────────────────────────────────┘
 ```
 
-#### （1）第一层：接入层（任务入口，解耦输入）
-核心职责：接收各类任务请求，校验合法性，标准化格式，送入后续流程，支持多入口插件化扩展，避免单一入口瓶颈。
--  支持的接入方式（插件化，可按需扩展）：
-  1.  API接口（RESTful/GRPC）：支持程序调用、自动化部署、第三方系统集成（核心入口）；
-  2.  CLI命令行：支持运维人员手动提交、修改、删除任务；
-  3.  静态配置：支持类似Crontab的配置文件，加载静态周期性任务，兼容传统运维习惯；
-  4.  事件触发：支持监听外部事件（如文件变更、消息队列消息、数据库变更、HTTP回调）触发任务；
--  核心功能：
-  1.  任务合法性校验：校验参数格式、用户权限、资源请求合理性、触发规则有效性；
-  2.  任务标准化：将不同接入方式的任务转换为「通用任务模型」（见下文），统一后续流程处理格式；
-  3.  异步入队：将标准化任务送入内存队列，异步提交到存储层，避免阻塞接入请求，提升吞吐量。
+一个简单的架构示意图如下
 
-#### （2）第二层：存储层（数据持久化，保障一致性）
-核心职责：持久化所有核心数据，保证任务不丢失、状态可追溯，支持单机/分布式部署，插件化存储选型，适配不同场景的一致性需求。
--  核心存储数据：
-  1.  任务元数据：通用任务模型、触发规则、执行配置、容错配置、优先级；
-  2.  集群状态：节点信息（资源、健康状态、标签、执行器状态）、调度器状态、集群拓扑；
-  3.  运行数据：调度记录、执行结果、日志地址、重试记录、死信队列数据；
--  存储选型（插件化，按需适配场景）：
-  1.  单机场景：SQLite、本地文件、Redis（单节点），追求轻量无依赖；
-  2.  分布式场景：ETCD（强一致性、高可用，推荐）、MySQL（关系型，支持复杂查询和事务）、MongoDB（文档型，灵活扩展）；
--  关键要求：
-  1.  数据持久化：任务元数据、运行数据必须持久化，避免调度器重启后任务丢失；
-  2.  一致性保障：分布式场景下采用Raft/Paxos协议（ETCD）或数据库事务，避免数据不一致（如任务重复分配、状态错乱）；
-  3.  缓存优化：将热点数据（待调度任务、节点状态）缓存到内存，减少存储访问开销，提升调度性能。
+```mermaid
+flowchart TD
+    %% API
+    subgraph API
+        direction TB
+        CommandLineTool
+        SDKs
+        WebConsole
+        API-Gateway
+
+        CommandLineTool --> API-Gateway
+        WebConsole --> API-Gateway
+        SDKs --> API-Gateway
+    end
+
+    %% 调度核心（Scheduler Core）
+    subgraph 调度核心[Scheduler Core]
+        direction TB
+        LeaderNode[Leader Node]
+        FollowerNodes[Follower Node]
+        HashedWheel[HashedWheel<br/>Min-Heap]
+        WorkerPicker[Find a worker by Algorithm]
+        InMemoryQueue[in-memory queue]
+
+        LeaderNode -->|心跳 状态同步| FollowerNodes
+        LeaderNode -->|AddTask| HashedWheel
+        HashedWheel -->|Schedule| InMemoryQueue
+        InMemoryQueue -->|TaskDueToRun| WorkerPicker
+    end
+
+    %% Dispatch Channel(Dispatch Channel)
+    subgraph DispatchChannel
+        DirectRPC[Direct RPC]
+        MsgQueue[Message Queue]
+    end
+
+    %% Execution Plane
+    subgraph ExecutionPlane[ExecutionPlane]
+        direction TB
+        subgraph WorkerGroupA[Worker Runner Group A]
+            Worker1[Worker 1]
+            Worker2[Worker 2]
+        end
+        subgraph WorkerGroupB[Worker Runner Group B]
+            Worker3[Worker 3]
+        end
+        DistLock[分布式锁<br/>Redis Zookeeper]
+
+        %% 执行平面内交互
+        Worker1 -->|Lock| DistLock
+        Worker2 -->|Lock| DistLock
+        Worker3 -->|Lock| DistLock
+        Worker1 -->|Unlock| DistLock
+        Worker2 -->|Unlock| DistLock
+        Worker3 -->|Unlock| DistLock
+    end
+
+    %% 模块4：Store
+    subgraph ControlPlane
+        JobTriggerAPI[Job Trigger API<br/>REST gRPC]
+        JobStore[Job/Trigger Store<br/>MySQL Postgres]
+        Auth[权限&多租户]
+        
+        %% 控制平面内交互
+        Auth --> JobTriggerAPI
+        JobTriggerAPI --> JobStore
+    end
+
+    %% 模块5：Observability
+    subgraph Observability[Observability]
+        Metrics[Metrics<br/>Prometheus]
+        Logging[Logging<br/>ELK Loki]
+        Tracing[Tracing<br/>Jaeger Zipkin]
+        AuditLog[审计日志]
+    end
+
+
+    API-Gateway --> JobTriggerAPI
+    LeaderNode -->|Optional| WorkerPicker
+    WorkerPicker --> DirectRPC
+    LeaderNode -->|Scan| JobStore
+    WorkerPicker -->|Dispatch|MsgQueue
+
+    DirectRPC -->|Push Pull| Worker1
+    DirectRPC -->|Push Pull| Worker2
+    MsgQueue -->|Push Pull| Worker3
+
+    Worker1 -->|Record Status| JobStore
+    Worker2 -->|Record Status| JobStore
+    Worker3 -->|Record Status| JobStore
+
+    Worker1 -->|report| Metrics
+    Worker2 -->|report| Logging
+    Worker3 -->|report| Tracing
+    
+    JobStore -->|record| AuditLog
+    LeaderNode --> JobStore
+```
+
+**ControlPlane**
+
+- API & UI：提供 RESTful API 和 Web 界面，供用户和外部系统创建、管理、监控任务。
+- Job/Trigger Store (任务存储)：持久化存储 Job（任务定义）和 Trigger（触发器规则）的信息。持久化所有核心数据，保证任务不丢失、状态可追溯，支持单机/分布式部署，插件化存储选型；分布式场景下采用Raft/Paxos协议（ETCD）或数据库事务，避免数据不一致（如任务重复分配、状态错乱）；将热点数据（待调度任务、节点状态）缓存到内存，减少存储访问开销，提升调度性能；
+  -  核心存储数据：
+    1. 任务元数据：通用任务模型、触发规则、执行配置、容错配置、优先级；
+    2. 集群状态：节点信息（资源、健康状态、标签、执行器状态）、调度器状态、集群拓扑；
+    3. 运行数据：调度记录、执行结果、日志地址、重试记录、死信队列数据；
+- 权限与多租户模块：负责认证和授权，确保用户只能操作其有权限的任务，并实现租户间的资源隔离。
+
+**Scheduler Core**
+
+- Leader 选举与 HA：调度器核心通常以多实例（Leader + Followers）模式部署以实现高可用。通过 ZooKeeper 或 Raft 协议（如 Etcd）进行 Leader 选举，确保在任何时刻只有一个实例在进行实际的调度决策。Followers 作为热备，随时准备在 Leader 宕机时接管。
+- **触发模块** 
+  - 时间轮 (Hashed Wheel) vs. 最小堆 (Min-Heap)：这是实现定时触发的两种经典数据结构。
+    - 时间轮：类似于一个时钟，指针每秒（或每毫秒）移动一格，格子里存放着将在该时刻到期的任务。插入和删除操作的时间复杂度为 O(1)，非常高效，适合任务量巨大且对精度要求不是极高的场景。
+    - 最小堆：将所有待执行的任务按其下一次触发时间构建一个最小堆，堆顶永远是最近将要到期的任务。每次取出堆顶任务执行，并计算其下一次触发时间，再重新插入堆中。它精度更高，但每次操作复杂度为 O(log N)，在任务量极大时性能可能不及时间轮。
+  - 事件驱动 (Event-driven)：Leader 节点从 Store 中加载即将到期的任务到内存（时间轮或最小堆）。当任务到期时，它不是直接执行，而是生成一个“触发事件”，并将该事件推送到分发通道。这种事件驱动的设计将“决定何时触发”和“如何分发执行”解耦。
+- **资源调度模块**：将任务分配到最优节点/执行器，兼顾可行性和最优性，支持单机/分布式、容器/非容器场景，插件化扩展调度规则
+  1.  **预选（Predicates）—— 硬约束过滤**：
+     -  内置默认规则：资源充足、节点健康、标签匹配、端口不冲突、存储可用；
+     -  自定义规则：插件化添加（如异构架构匹配、网络带宽限制、成本管控、业务权限校验）；
+     -  输出：可行节点/执行器集；
+  2.  **优选（Priorities）—— 软约束打分**：
+     -  内置默认规则（可配置权重）：资源使用率均衡、负载均衡、亲和性匹配、执行器性能优先、成本优先；
+     -  自定义规则：插件化添加（如就近部署、业务优先级、容灾需求、历史执行成功率）；
+     -  输出：得分最高的节点/执行器；
+  3.  **绑定与容错**：分布式锁避免重复分配，无可行节点时支持任务排队、告警、降级到备用节点，记录绑定日志。
+
+**Dispatch Channel**
+
+- 消息队列 (Message Queue)：如 Kafka, RabbitMQ。这是最常用和推荐的分发方式。调度器核心将触发事件作为消息发送到 MQ，Worker 从 MQ 中消费这些消息。MQ 天然地提供了削峰填谷、负载均衡和持久化能力。
+- 直接 RPC 调用：对于一些特殊的、需要低延迟响应的任务，调度器也可以直接通过 RPC 调用 Worker。这种方式耦合度更高，但省去了 MQ 的延迟。
+
+**Execution Plane**
+
+- Worker/Runner：实际执行任务的进程或节点。它们可以被组织成不同的 Worker Group，订阅不同的任务类型。
+- Push vs. Pull 模式：
+  - Push：调度器（或 MQ）将任务直接推送给 Worker。
+  - Pull：Worker 主动向调度器（或 MQ）拉取任务。Pull 模式更利于 Worker 根据自身负载进行流控。
+- 执行锁与去重 (Distributed Lock)：为了实现 At-least-once + 幂等，Worker 在执行任务前，需要基于一个唯一的 invocation_id 去获取一个分布式锁（如基于 Redis 的 SETNX 或 ZooKeeper 的临时节点）。如果获取锁失败，说明有其他 Worker 正在执行同一个任务，当前 Worker 就直接放弃。
+
+**Observability**
+
+- 状态与运行记录：所有任务的创建、修改、触发、执行开始、执行成功/失败等状态都应被详细记录到 Store 中，用于审计和问题排查。
+- Metrics/Alerting/Tracing：
+  - Metrics：暴露 Prometheus 指标，如任务触发延迟、执行耗时、成功率、失败率、补发率等。
+  - Logging：所有模块产生结构化的日志，汇集到 ELK 或 Loki 等系统中。
+  - Tracing：通过 OpenTelemetry 等工具实现分布式链路追踪，串联起从 API 调用到任务最终执行的整个流程。
+
+
 
 #### （3）第三层：调度核心层（大脑，解决「何时/在哪执行」）
 这是通用Job Scheduler的核心，拆解为两个子模块，分别对应「何时执行」和「在哪执行」，均支持插件化扩展，兼顾性能与灵活性。
@@ -440,143 +640,8 @@ graph TB
 3. **容错性**：调度失败可重试，避免状态不一致
 4. **扩展性**：策略通过插件注册，支持自定义逻辑
 
----
+-
 
-## **二、K8s Scheduler深度解析**
-
-K8s Scheduler是**分布式资源调度**的典范，其设计体现了"**预选+优选**"的两阶段模型。
-
-### **2.1 架构与工作流程**
-
-```mermaid
-sequenceDiagram
-    participant API as API Server
-    participant Q as 调度队列
-    participant P as 预选阶段
-    participant S as 优选阶段
-    participant B as 绑定阶段
-    participant K as Kubelet
-
-    API->>Q: 监听到Pending Pod
-    Q->>P: 取出待调度Pod
-    P->>API: 获取所有Node列表
-    P->>P: 应用过滤策略
-    P->>S: 输出候选节点(如10个)
-    S->>S: 应用打分策略
-    S->>B: 选出最高分Node
-    B->>API: 创建Binding对象
-    API->>K: 通知目标节点
-    K->>K: 启动容器
-```
-
-### **2.2 核心调度阶段**
-
-**阶段1：预选（Filtering）——硬性筛选**
-- **目标**：从全量节点中快速淘汰不满足硬性条件的节点
-- **关键策略**：
-  - `NodeResourcesFit`：检查CPU/Memory/GPU是否充足
-  - `TaintToleration`：验证节点污点与Pod容忍度匹配
-  - `PodAffinityPredicate`：检查节点是否满足Pod亲和/反亲和规则
-  - `NodeSelector`：匹配节点标签（如`disk-type: ssd`）
-
-**阶段2：优选（Scoring）——精细化打分**
-- **目标**：对候选节点计算优先级分数，选择最优者
-- **核心算法**：
-  ```
-  NodeScore = Σ(策略权重 × 策略分数)
-  ```
-- **典型策略**：
-  - `BalancedResourceAllocation`：倾向CPU/内存利用率均衡的节点，避免单资源瓶颈
-  - `LeastAllocated`：优先选择资源利用率低的节点，实现负载均衡
-  - `ImageLocalityPriority`：优先选择已缓存镜像的节点，加速启动
-
-**阶段3：预留（Reserve）——资源预占**（v1.16+引入）
-- 将Pod资源需求"预占"到目标节点，防止并发调度冲突
-- 若后续绑定失败，自动释放预留资源
-
-**阶段4：绑定（Bind）——提交决策**
-- 向API Server发送Binding对象，将Pod与Node绑定
-- Kubelet监听到绑定事件后启动容器
-
-### **2.3 高级特性**
-
-**调度框架（Scheduling Framework）**：
-- 在预选/优选前后提供多个**扩展点**（PreFilter、PostBind等）
-- 允许注入自定义逻辑，如审计日志、资源预留
-
-**抢占调度（Preemption）**：
-- 高优先级Pod无法调度时，驱逐低优先级Pod
-- 策略：选择牺牲品 → 优雅终止（30秒）→ 调度高优先级Pod
-
-**性能优化**：
-- **本地缓存**：缓存节点和Pod状态，减少对API Server的调用
-- **并行调度**：支持同时处理多个Pod
-- **优先级队列**：按优先级处理不同重要性的Pod
-
----
-
-## **三、Linux Cron Job设计原理**
-
-Linux cron是**时间驱动调度**的经典实现，已稳定运行数十年。其核心是`crond`守护进程。
-
-### **3.1 架构设计**
-
-```mermaid
-graph LR
-    A[crontab文件] --> B[crond守护进程]
-    B --> C{时间匹配引擎}
-    C -->|匹配| D[fork子进程]
-    D --> E[执行命令]
-    E --> F[邮件/日志输出]
-    
-    B --> G[每分钟检查]
-```
-
-### **3.2 核心机制**
-
-**时间匹配算法**
-- **Cron表达式**：`分 时 日 月 周` 五个字段，支持`*`、`,`、`-`、`/`等操作符
-- **匹配逻辑**：每分钟唤醒一次，遍历所有crontab任务，检查当前时间是否匹配表达式
-- **高效实现**：使用位掩码存储时间字段，将匹配复杂度降至O(1)
-
-**执行流程**
-1. **加载配置**：启动时读取`/etc/crontab`、`/etc/cron.d/`及用户crontab文件
-2. **定期检查**：每分钟检查一次，精确到秒级唤醒
-3. **任务派生**：匹配的任务通过`fork()`创建子进程，在子进程中执行命令
-4. **输出处理**：标准输出/错误通过邮件发送给任务所有者，或重定向到日志
-
-**关键设计特点**
-- **极简性**：仅259行核心代码（Vixie Cron实现）
-- **无状态**：不维护任务执行历史，每次调度独立
-- **权限隔离**：通过setuid/setgid切换用户身份执行
-- **环境隔离**：每次执行新建进程，环境干净
-
----
-
-## **四、两种调度器的对比与启示**
-
-| 维度 | K8s Scheduler | Linux Cron |
-|------|---------------|------------|
-| **调度触发** | **事件驱动**（Pod创建） | **时间驱动**（每分钟检查） |
-| **决策复杂度** | 多阶段（预选+优选） | 无决策（时间匹配） |
-| **资源感知** | 全局资源视图，动态更新 | 无资源感知 |
-| **容错机制** | 预留、抢占、重试 | 简单重试（失败邮件通知） |
-| **扩展性** | 插件框架，高度可定制 | 固定表达式，不可扩展 |
-| **适用场景** | 分布式资源调度 | 单机定时任务 |
-
-### **从中学到的通用设计模式**
-
-1. **两阶段筛选模式**：K8s的"预选+优选"可应用于任何资源匹配场景。先快速过滤，再精细化评估。
-
-2. **事件驱动架构**：通过监听API Server事件而非轮询，大幅降低系统负载。通用设计中可采用消息队列（Kafka）或Watch机制。
-
-3. **策略插件化**：将调度策略抽象为接口，支持热插拔。K8s的Scheduling Framework是绝佳参考。
-
-4. **状态缓存**：K8s的本地缓存设计减少了90%以上的API Server调用。任何调度器都应维护轻量级状态副本来提升性能。
-
-5. **时间轮算法**（适用于Cron类调度）：将任务按时间分桶，实现O(1)的调度触发，避免每分钟全量扫描。
-
----
 
 ## **五、设计一个通用Job Scheduler的实战指南**
 
@@ -1393,203 +1458,14 @@ class PerformanceOptimizer:
 
 
 一、什么是 Job Scheduler：当代码需要“闹钟”
-简单来说，Job Scheduler（任务调度器）就是为代码或程序配置的“闹钟”。我们不再需要手动触发某个脚本或命令，而是预先设定好规则，调度器会像一位不知疲倦的管家，在指定的时间或条件下，自动执行这些任务。
-它的核心职责是回答两个问题：“何时执行？” 与 “在哪执行？”。根据对这两个问题的不同侧重，调度器可以分为两大类：
-- 时间触发调度 (Time-based Scheduling)：更关心“何时执行”。这类调度器专注于根据预设的时间点（如每天凌晨 2 点）、时间间隔（如每 5 分钟）或日历规则来触发任务。Linux Cron 是其最经典的代表。
-- 资源调度 (Resource-based Scheduling)：更关心“在哪执行”。这类调度器负责在资源池（如服务器集群）中，为任务（如一个容器或应用实例）寻找最合适的“家”。它需要综合考虑节点的 CPU、内存、存储、网络以及各种复杂的策略（如亲和性、污点），来做出最优决策。Kubernetes Scheduler 是该领域的典范。
-此外，根据部署规模，调度器也分为单机调度器（如 Cron）和分布式调度器。我们后续将要设计的通用方案，就属于分布式时间触发调度器的范G畴。
-在深入设计之前，理解以下几个通用概念至关重要，它们是衡量任何一个调度系统成熟度的关键标尺：
-1. 一致性语义 (Consistency Semantics)
-调度系统对任务执行的承诺是什么？
-- At-least-once (至少一次)：这是最常见和实用的模型。系统保证任务至少会被成功执行一次。在网络分区、节点故障等异常情况下，任务可能会被重复执行。因此，它强烈依赖任务自身的幂等性来保证最终结果的正确性。
-- Exactly-once (精确一次)：最严格的模型，保证任务在任何情况下都不多不少，只被成功执行一次。这在技术上实现成本极高，通常需要分布式事务、状态快照和原子提交等复杂机制的配合。对于绝大多数业务场景，追求绝对的“精确一次”性价比很低。
-2. 幂等性 (Idempotency)
-幂等性是指一个操作无论执行一次还是多次，其产生的影响和结果都是相同的。它是实现 At-least-once 语义的基石。
-示例：一个“创建订单”的任务，如果简单地执行数据库 INSERT，重复执行就会创建多笔相同订单。但如果引入一个唯一的“订单请求 ID”，在执行 INSERT 前先检查该 ID 是否已存在，任务就变得幂等了。
-3. 重试与补偿 (Retry & Compensation)
-- 重试 (Retry)：当任务执行失败时（如网络超时、依赖服务不可用），调度系统应具备自动重试的能力。简单的立即重试可能会加剧下游系统压力，因此通常会采用指数退避（Exponential Backoff）等策略，逐步拉长重试间隔。
-- 补偿 (Compensation)：当一个由多个步骤组成的业务流程失败时，仅仅重试失败的步骤可能不够。补偿是指执行一个“反向操作”，以撤销已经成功完成的步骤，使系统状态回滚。例如，订单创建成功但支付失败，补偿操作可能就是“取消订单”。
-
----
-二、Linux Cron 设计思路与原理：简单即是力量
-cron 是 Unix/Linux 系统中一个历久弥坚的工具，自 1975 年诞生以来，其核心设计几乎未变。它完美诠释了 Unix “做一件事并把它做好”的设计哲学。cron 是一个典型的、单机的、基于时间的调度器。
-1. 组件角色与核心工作流
-cron 的世界主要由以下几个部分构成：
-- crond 守护进程：cron 的心脏。这个后台进程在系统启动时运行，是所有定时任务的执行者。
-- 用户 Crontab：每个用户都可以拥有自己的 crontab 文件，通过 crontab -e 命令编辑。这些文件通常存储在 /var/spool/cron/ 目录下（如 /var/spool/cron/zhaojieyi），并且只有文件所有者和 root 用户可以读写。
-- 系统 Crontab：
-  - /etc/crontab：系统级别的主 crontab 文件。与用户 crontab 不同，它需要额外指定执行任务的用户名。
-  - /etc/cron.d/：这是一个目录，允许系统服务或应用程序（如 yum）放置自己的 crontab 配置文件，而无需修改主配置文件，便于包管理。
-  - /etc/cron.hourly, /etc/cron.daily, /etc/cron.weekly, /etc/cron.monthly：这些目录下的可执行脚本会被 /etc/crontab 中预设的规则（通常由 run-parts 命令执行）分别按小时、天、周、月触发。
-- MAILTO 环境变量：如果在 crontab 文件中设置了 MAILTO=your.email@example.com，那么任务执行的任何输出（STDOUT 或 STDERR）都会被作为邮件发送到指定邮箱。如果 MAILTO 为空（MAILTO=""），则不发送邮件。这是 cron 最原始的可观察性机制。
-- 日志：crond 的活动（如任务的开始与结束）通常被记录到系统日志中，如 /var/log/cron 或 /var/log/syslog，具体位置取决于系统发行版。
-2. 触发模型：分钟级的轮询
-cron 的工作模式极其简单直接：
-1. 分钟轮询：crond 守护进程每分钟醒来一次。
-2. 解析与比对：它会检查所有 crontab 文件（包括 /etc/crontab, /etc/cron.d/* 以及 /var/spool/cron/*）中记录的每一个任务。
-3. 计算匹配：对于每个任务，它会将其 cron 表达式与当前的系统时间（分钟、小时、日、月、周）进行匹配。
-4. 执行任务：如果匹配成功，crond 会在一个新的 shell 环境中执行该任务指定的命令。
-Cron 表达式格式：
-# ┌───────────── 分钟 (0 - 59)
-# │ ┌───────────── 小时 (0 - 23)
-# │ │ ┌───────────── 日 (1 - 31)
-# │ │ │ ┌───────────── 月 (1 - 12)
-# │ │ │ │ ┌───────────── 周 (0 - 6) (周日可用 0 或 7)
-# │ │ │ │ │
-# │ │ │ │ │
-# * * * * * <要执行的命令>
-
-示例：30 4 * * 1 /usr/bin/backup.sh 表示在每周一的凌晨 4:30 执行备份脚本。
-3. 关键设计与权衡
-Misfire (错过触发) 行为
-如果任务预定执行时，机器处于关机状态，会发生什么？标准的 crond 不会做任何事。它不会在系统重启后“补偿”执行错过的任务。因为它的设计模型非常简单：只关心“当前这一分钟”应该做什么。
-为了解决这个问题，anacron 工具应运而生。它通常用于桌面或笔记本电脑，这些设备不会 24/7 运行。anacron 会记录任务的最后一次执行时间戳，并在系统启动时检查是否有任务错过了执行周期（如“天”、“周”），如果有，则立即执行它。
-现代 Linux 系统中，systemd Timers 提供了比 cron 和 anacron 更强大和灵活的功能，例如秒级精度、更丰富的依赖关系、更好的日志集成以及处理错过任务的策略（通过 Persistent=true）。
-时区与夏令时（DST）
-这是一个 cron 著名的“坑”。crond 使用其所在操作系统的系统时区来解释 crontab 中的时间。这在夏令时（DST）切换时会导致问题：
-- 时钟向前拨快一小时（例如，从 02:00 变为 03:00）：如果你的任务恰好定在 02:30 执行，那么这一天它将不会被执行，因为 02:30 这个时间点“消失”了。
-- 时钟向后拨慢一小时（例如，从 02:00 回到 01:00）：如果你的任务定在 01:30 执行，它可能会被执行两次。
-这清晰地表明 cron 的设计并未考虑复杂的时钟行为，它只信任操作系统报告的“当前时间”。
-权限与安全
-- 用户隔离：每个用户的 crontab 任务默认以该用户的身份运行，保证了基本的权限隔离。
-- cron.allow 与 cron.deny：管理员可以通过 /etc/cron.allow 和 /etc/cron.deny 文件来精确控制哪些用户可以使用 crontab 命令。
-  - 如果 cron.allow 存在，则只有列在其中的用户可以使用。
-  - 如果 cron.allow 不存在但 cron.deny 存在，则列在 cron.deny 中的用户不能使用。
-- MTA 集成：MAILTO 功能依赖于一个正常工作的邮件传输代理（MTA），如 sendmail 或 postfix。如果系统没有配置 MTA，邮件通知将失败。
-4. 设计要点总结
-cron 的设计哲学可以总结为：
-- 简单性 (Simplicity)：核心逻辑是每分钟轮询一次，易于理解和实现。
-- 健壮性 (Robustness)：依赖于操作系统，没有复杂的内部状态，进程崩溃后重启即可恢复工作，几乎“无状态”。
-- 可观察性 (Observability)：通过系统日志和邮件提供了基础但有效的任务执行反馈。
-- 无强一致性承诺：它不保证任务一定会被执行（如关机或 DST），也不保证只执行一次。它提供的是一种“尽力而为”的调度。
-cron 的成功在于它精准地满足了单机环境下绝大多数的周期性任务需求，而没有引入不必要的复杂性。它的局限性——如无秒级粒度、DST 问题、不支持分布式、无内置高可用——也恰恰为更现代、更复杂的调度器（如 Kubernetes Scheduler 和通用分布式调度器）的诞生指明了方向。
-
----
-三、Kubernetes Scheduler 原理：集群的“资源管家”
-与 cron 专注于“时间”不同，Kubernetes Scheduler (kube-scheduler) 是一个纯粹的资源调度器。它的核心职责是为新创建的、尚未分配节点的 Pod，在集群中找到一个最合适的“家”（Node）。
-kube-scheduler 的工作流程可以被看作一个持续不断的“ matchmaking” 过程：
-1. 监听 (Watch)：kube-scheduler 通过 watch 机制持续监控 etcd。一旦发现有 spec.nodeName 字段为空的新 Pod 被创建，它就会将其纳入自己的调度队列。
-2. 调度周期 (Scheduling Cycle)：kube-scheduler 从队列中取出一个 Pod，为其开启一个调度周期。这个周期分为两个主要阶段：
-  - 过滤 (Filtering / Predicates)：遍历集群中所有可用的 Node，通过一系列“硬性”规则（称为“断言”或 Predicates）进行筛选，淘汰掉不满足条件的 Node。例如，如果一个 Node 的内存不足以满足 Pod 的请求，它就会在这一步被淘汰。
-  - 打分 (Scoring / Priorities)：对通过了过滤阶段的所有候选 Node，kube-scheduler 会运行一系列“软性”规则（称为“优先级函数”或 Priorities）为它们打分。分数越高的 Node，代表它越“适合”这个 Pod。例如，一个已经缓存了 Pod 所需镜像的 Node，可能会获得更高的分数。
-3. 绑定 (Binding)：kube-scheduler 选出得分最高的 Node，然后执行“绑定”操作——即更新 Pod 的 spec.nodeName 字段，将其指向目标 Node。这个绑定信息被写回 etcd。
-4. Kubelet 接管：目标 Node 上的 kubelet 进程监听到这个绑定事件后，就会立即在该 Node 上创建并运行 Pod 所需的容器。
-这个过程看似简单，但其背后是一个高度可扩展和精密的调度框架 (Scheduling Framework)。
-Scheduling Framework：插件化的调度艺术
-从 Kubernetes v1.15 开始，调度器内部的逻辑被重构成了一系列插件化的扩展点 (Extension Points)。这使得开发者可以非常灵活地实现自定义的调度逻辑，而无需修改调度器核心代码。
-暂时无法在飞书文档外展示此内容
-一个完整的调度周期被细分为以下几个阶段，每个阶段都可以注册一个或多个插件：
-1. 调度周期 (Scheduling Cycle)
-- QueueSort (队列排序)：决定调度队列中哪个 Pod 应该被优先调度。默认使用 PrioritySort，即 Pod 的优先级（priorityClassName）越高，越先被调度。
-- PreFilter (预过滤)：在正式过滤前对 Pod 信息进行预处理或预检查。
-- Filter (过滤)：核心过滤阶段，插件在此检查 Node 是否满足 Pod 的硬性要求。任何一个 Filter 插件返回“不满足”，该 Node 就会被淘汰。
-- PostFilter (后过滤)：当一个 Pod 经过 Filter 阶段后，若没有找到任何可用的 Node，此阶段的插件会被调用。最典型的用例是抢占 (Preemption)，即尝试驱逐一个或多个低优先级的 Pod 来为当前高优先级 Pod 腾出空间。
-- PreScore (预打分)：在打分前进行一些共享状态的计算，以供后续的 Score 插件使用，避免重复计算。
-- Score (打分)：为通过 Filter 阶段的每个 Node 打分。每个插件都会给出一个分数，最终的分数是所有插件分数的加权和。
-- NormalizeScore (归一化打分)：将各个 Score 插件返回的分数归一化到 [0, 100] 的范围内，使其具有可比性。
-2. 绑定周期 (Binding Cycle)
-在选出最优 Node 后，进入绑定周期：
-- Reserve (预留)：在内存中将 Pod 的资源“预留”给选定的 Node。这是一个重要的步骤，确保在实际绑定完成前，其他 Pod 不会占用这些资源。
-- Permit (许可)：这是一个“等待”阶段。插件可以在此阶段延迟或拒绝 Pod 的绑定。例如，等待外部资源（如一个特殊的 GPU）准备就绪。如果超时或被拒绝，Pod 将会回到调度队列。
-- PreBind (预绑定)：在实际绑定前执行一些准备工作，例如挂载网络卷。
-- Bind (绑定)：执行真正的绑定操作，调用 API Server 的接口更新 Pod 的 .spec.nodeName。
-- PostBind (后绑定)：绑定成功后执行的收尾工作，如清理资源。
-典型插件与策略
-kube-scheduler 内置了丰富的插件来实现各种调度策略：
-- NodeResourcesFit (Filter & Score)：最基础的插件，检查 Node 的 CPU、内存、存储等资源是否满足 Pod 的 requests。在 Score 阶段，它会根据资源使用率给 Node 打分（如 LeastAllocated 策略倾向于选择空闲资源多的节点，MostAllocated 则相反）。
-- InterPodAffinity/AntiAffinity (Filter & Score)：实现 Pod 间的亲和性与反亲和性。例如，你可以配置“让前端 Pod 尽可能和后端 Pod 部署在同一个可用区（亲和性）”，或者“同一应用的不同副本必须部署在不同的 Node 上（反亲和性）”。
-- TaintToleration (Filter)：处理节点的“污点 (Taints)”和 Pod 的“容忍 (Tolerations)”。如果一个 Node 有污点（如 special-gpu=true:NoSchedule），那么只有声明了相应容忍的 Pod 才能被调度上去。
-- ImageLocality (Score)：如果一个 Node 已经缓存了 Pod 需要的容器镜像，这个插件会给它加分，以加快 Pod 的启动速度。
-- PodTopologySpread (Filter & Score)：实现 Pod 在不同拓扑域（如可用区、机架、主机）的均衡分布，避免因单点故障导致整个应用不可用。
-- VolumeBinding (Filter & Score)：处理与持久化卷 (PV/PVC) 相关的调度，确保 Pod 被调度到能够访问其所需存储的 Node 上。
-Extender 的历史与现状
-在 Scheduling Framework 出现之前，扩展调度器的主要方式是 Extender。它允许你运行一个外部的 Webhook 服务，kube-scheduler 会在 Filter 和 Score 阶段通过 HTTP 调用这个服务来获取额外的调度决策。
-然而，Extender 的性能开销较大（每次调度都需要网络调用），且扩展点有限。如今，官方强烈建议优先使用 Scheduling Framework 插件，因为它性能更好、集成更紧密、功能更强大。
-配置示例：定制你的调度策略
-你可以通过 KubeSchedulerConfiguration 文件来定制调度器的行为，比如启用/禁用插件、调整插件顺序或权重。
-KubeSchedulerConfiguration 示例片段：
-apiVersion: kubescheduler.config.k8s.io/v1
-kind: KubeSchedulerConfiguration
-leaderElection:
-  leaderElect: true
-profiles:
-- schedulerName: default-scheduler
-  plugins:
-    # 调整 Score 插件的权重
-    score:
-      enabled:
-      - name: ImageLocality
-        weight: 3 # 提高镜像本地性插件的权重
-      - name: NodeResourcesBalancedAllocation
-        weight: 2 # 降低资源均衡分配的权重
-      disabled:
-      - name: TaintToleration # 禁用 TaintToleration 的打分功能
-  pluginConfig:
-  # 为特定插件提供详细配置
-  - name: NodeResourcesFit
-    args:
-      scoringStrategy:
-        type: "LeastAllocated" # 倾向于调度到资源最空闲的节点
-
-这份配置将 ImageLocality 的权重提升至 3，意味着调度器会更倾向于将 Pod 调度到已经有相关镜像的节点上，以此来优化启动时间。
-Kubernetes Scheduler 的设计体现了在复杂分布式系统中进行资源管理的精密与权衡。它通过一个可插拔、分阶段的框架，将通用的调度逻辑与特定的业务策略解耦，提供了极高的灵活性和可扩展性。
 
 ---
 四、更通用的分布式 Job Scheduler 设计指南
 在理解了 cron 的简单和 kube-scheduler 的专注之后，我们来设计一个更通用的、能应对复杂业务场景的分布式时间触发调度器。这个系统不仅要解决“何时执行”，还要解决在分布式环境下“如何可靠、高效地分发和执行”。
 暂时无法在飞书文档外展示此内容
-1. 需求视角：一个现代调度器应该具备什么？
-在设计之初，我们首先要明确一个现代化的分布式 Job Scheduler 需要满足哪些核心需求。
-- 触发类型 (Trigger Types)：
-  - Cron 表达式：兼容标准 Cron，提供灵活的周期性调度。
-  - 固定频率 (Fixed Rate/Delay)：例如，“每隔 5 分钟执行一次”。
-  - 日历与例外 (Calendar & Exclusions)：支持复杂的日历逻辑，如“每个月的最后一个工作日”，并能排除特定日期（如法定节假日）。
-  - 执行窗口 (Time Windows)：定义任务只能在某个时间窗口内运行（白名单），或者不能在某个窗口内运行（黑名单）。
-  - 一次性任务 (One-shot)：在未来的某个特定时间点执行一次。
-- 执行语义 (Execution Semantics)：
-  - 幂等性与去重：系统应提供机制来辅助实现幂等性，例如为每次触发生成唯一的 invocation_id，并提供分布式锁防止重复执行。
-  - 并发策略 (Concurrency Policy)：当一个任务的下一次触发时间到达，但上一次执行还未结束时，系统应如何处理？
-    - Forbid：禁止并发执行，跳过本次触发。
-    - Allow：允许并发执行，新老任务并行。
-    - Replace：用新任务替换掉正在运行的老任务。
-  - Misfire 策略：当任务因调度器宕机等原因错过触发点时，恢复后应如何处理？
-    - Skip：跳过所有错过的触发。
-    - FireOnceNow：立即补发一次。
-    - FireAllMissed：补发所有错过的触发。
-  - Catch-up / Backfill (补数据)：支持手动触发一个任务，并回溯执行过去某个时间段内的所有周期。
-- 多租户与配额 (Multi-tenancy & Quotas)：
-  - 公平性：当大量任务同时到期时，如何确保不同租户或不同优先级的任务能公平地获得执行机会？可以借鉴 DRF (Dominant Resource Fairness) 思想，平衡不同维度的资源分配。
-  - 优先级与抢占：高优先级的任务应该能优先被调度和执行，甚至在资源紧张时抢占低优先级任务。
-  - 速率限制与背压 (Rate Limiting & Backpressure)：当任务执行速度跟不上生产速度时，Worker 应能向上游（调度器或消息队列）反馈压力，减缓任务分发速度，防止系统雪崩。
-2. 架构模块：一个分布式调度器的“五脏六腑”
-一个健壮的分布式 Job Scheduler 通常由以下几个核心模块组成：
-控制面 (Control Plane)
-- Job/Trigger Store (任务存储)：持久化存储 Job（任务定义）和 Trigger（触发器规则）的信息。通常使用关系型数据库（如 MySQL, Postgres）来保证数据的一致性和事务性。
-- API & UI：提供 RESTful API 和 Web 界面，供用户和外部系统创建、管理、监控任务。
-- 权限与多租户模块：负责认证和授权，确保用户只能操作其有权限的任务，并实现租户间的资源隔离。
-调度器核心 (Scheduler Core)
-这是系统的大脑，负责在正确的时间点发出“执行”信号。
-- Leader 选举与 HA：调度器核心通常以多实例（Leader + Followers）模式部署以实现高可用。通过 ZooKeeper 或 Raft 协议（如 Etcd）进行 Leader 选举，确保在任何时刻只有一个实例在进行实际的调度决策。Followers 作为热备，随时准备在 Leader 宕机时接管。
-- 时间轮 (Hashed Wheel) vs. 最小堆 (Min-Heap)：这是实现定时触发的两种经典数据结构。
-  - 时间轮：类似于一个时钟，指针每秒（或每毫秒）移动一格，格子里存放着将在该时刻到期的任务。插入和删除操作的时间复杂度为 O(1)，非常高效，适合任务量巨大且对精度要求不是极高的场景。
-  - 最小堆：将所有待执行的任务按其下一次触发时间构建一个最小堆，堆顶永远是最近将要到期的任务。每次取出堆顶任务执行，并计算其下一次触发时间，再重新插入堆中。它精度更高，但每次操作复杂度为 O(log N)，在任务量极大时性能可能不及时间轮。
-- 事件驱动 (Event-driven)：Leader 节点从 Store 中加载即将到期的任务到内存（时间轮或最小堆）。当任务到期时，它不是直接执行，而是生成一个“触发事件”，并将该事件推送到分发通道。这种事件驱动的设计将“决定何时触发”和“如何分发执行”解耦。
-分发通道 (Dispatch Channel)
-- 消息队列 (Message Queue)：如 Kafka, RabbitMQ。这是最常用和推荐的分发方式。调度器核心将触发事件作为消息发送到 MQ，Worker 从 MQ 中消费这些消息。MQ 天然地提供了削峰填谷、负载均衡和持久化能力。
-- 直接 RPC 调用：对于一些特殊的、需要低延迟响应的任务，调度器也可以直接通过 RPC 调用 Worker。这种方式耦合度更高，但省去了 MQ 的延迟。
-执行面 (Execution Plane)
-- Worker/Runner：实际执行任务的进程或节点。它们可以被组织成不同的 Worker Group，订阅不同的任务类型。
-- Push vs. Pull 模式：
-  - Push：调度器（或 MQ）将任务直接推送给 Worker。
-  - Pull：Worker 主动向调度器（或 MQ）拉取任务。Pull 模式更利于 Worker 根据自身负载进行流控。
-- 执行锁与去重 (Distributed Lock)：为了实现 At-least-once + 幂等，Worker 在执行任务前，需要基于一个唯一的 invocation_id 去获取一个分布式锁（如基于 Redis 的 SETNX 或 ZooKeeper 的临时节点）。如果获取锁失败，说明有其他 Worker 正在执行同一个任务，当前 Worker 就直接放弃。
-可观测性 (Observability)
-- 状态与运行记录：所有任务的创建、修改、触发、执行开始、执行成功/失败等状态都应被详细记录到 Store 中，用于审计和问题排查。
-- Metrics/Alerting/Tracing：
-  - Metrics：暴露 Prometheus 指标，如任务触发延迟、执行耗时、成功率、失败率、补发率等。
-  - Logging：所有模块产生结构化的日志，汇集到 ELK 或 Loki 等系统中。
-  - Tracing：通过 OpenTelemetry 等工具实现分布式链路追踪，串联起从 API 调用到任务最终执行的整个流程。
-3. 关键设计取舍与伪代码示例
+
+
+1. 关键设计取舍与伪代码示例
 Cron 解析与下一触发时间计算
 // 伪代码：计算下一次触发时间
 function getNextTriggerTime(cronExpression, lastTriggerTime, timeZone) {
