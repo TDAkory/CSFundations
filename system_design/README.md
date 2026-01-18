@@ -12,3 +12,6 @@
 * FSM
 * 调度器（线程调度）
 * remote_compactor
+* Job Scheduler
+  * [job scheduler](./14_job_scheduler.md)
+  * [Notes](../../ZImages/excalidraw/job_scheduler_design.excalidraw)
